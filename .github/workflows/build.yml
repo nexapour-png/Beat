@@ -1,0 +1,380 @@
+name: Build APK
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+      - name: Create app files
+        run: |
+          mkdir -p app/src/main/java/com/beatcolour
+          cat > settings.gradle <<'EOF_FILE'
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = "BeatColour"
+          include ':app'
+          EOF_FILE
+          cat > build.gradle <<'EOF_FILE'
+          plugins {
+              id 'com.android.application' version '8.5.2' apply false
+              id 'org.jetbrains.kotlin.android' version '1.9.24' apply false
+          }
+          EOF_FILE
+          cat > gradle.properties <<'EOF_FILE'
+          org.gradle.jvmargs=-Xmx2048m
+          android.useAndroidX=false
+          EOF_FILE
+          cat > app/build.gradle <<'EOF_FILE'
+          plugins {
+              id 'com.android.application'
+              id 'org.jetbrains.kotlin.android'
+          }
+          android {
+              namespace 'com.beatcolour'
+              compileSdk 34
+              defaultConfig {
+                  applicationId "com.beatcolour"
+                  minSdk 24
+                  targetSdk 34
+                  versionCode 1
+                  versionName "1.0"
+              }
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = '17' }
+          }
+          EOF_FILE
+          cat > app/src/main/AndroidManifest.xml <<'EOF_FILE'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <application
+                  android:label="Beat Colour"
+                  android:theme="@android:style/Theme.Material.NoActionBar">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF_FILE
+          cat > app/src/main/java/com/beatcolour/MainActivity.kt <<'EOF_FILE'
+          package com.beatcolour
+
+          import android.app.Activity
+          import android.content.Intent
+          import android.graphics.Color
+          import android.media.MediaCodec
+          import android.media.MediaExtractor
+          import android.media.MediaFormat
+          import android.media.MediaPlayer
+          import android.net.Uri
+          import android.os.Bundle
+          import android.os.Handler
+          import android.os.Looper
+          import android.view.Gravity
+          import android.view.View
+          import android.view.ViewGroup
+          import android.view.WindowManager
+          import android.widget.*
+          import java.nio.ByteOrder
+          import kotlin.concurrent.thread
+          import kotlin.math.max
+          import kotlin.math.sqrt
+          import kotlin.random.Random
+
+          class MainActivity : Activity() {
+
+              private lateinit var root: FrameLayout
+              private lateinit var status: TextView
+              private lateinit var playBtn: Button
+              private lateinit var seek: SeekBar
+
+              private var uri: Uri? = null
+              private var env = FloatArray(0)      // bass energy, one value per frame
+              private var hopSec = 0.01f           // seconds per frame
+              private var beats = listOf<Float>()  // beat times in seconds
+              private var player: MediaPlayer? = null
+              private val handler = Handler(Looper.getMainLooper())
+              private var nextBeat = 0
+              private var hue = 0f
+              private val latencyFix = 0.03f       // tweak if colours feel early/late
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+
+                  root = FrameLayout(this).apply { setBackgroundColor(Color.BLACK) }
+
+                  val panel = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setBackgroundColor(Color.argb(170, 0, 0, 0))
+                      setPadding(32, 32, 32, 48)
+                  }
+                  status = TextView(this).apply {
+                      text = "Pick a video or mp3"
+                      setTextColor(Color.WHITE)
+                      textSize = 16f
+                  }
+                  val pick = Button(this).apply {
+                      text = "Choose file"
+                      setOnClickListener { pickFile() }
+                  }
+                  playBtn = Button(this).apply {
+                      text = "Play"
+                      isEnabled = false
+                      setOnClickListener { if (player == null) startPlay() else stopPlay() }
+                  }
+                  val sensLabel = TextView(this).apply {
+                      text = "Sensitivity (right = more cuts)"
+                      setTextColor(Color.WHITE)
+                  }
+                  seek = SeekBar(this).apply {
+                      max = 100
+                      progress = 50
+                      setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                          override fun onProgressChanged(s: SeekBar?, p: Int, fromUser: Boolean) {
+                              if (fromUser && env.isNotEmpty()) detect()
+                          }
+                          override fun onStartTrackingTouch(s: SeekBar?) {}
+                          override fun onStopTrackingTouch(s: SeekBar?) {}
+                      })
+                  }
+                  panel.addView(status)
+                  panel.addView(pick)
+                  panel.addView(playBtn)
+                  panel.addView(sensLabel)
+                  panel.addView(seek)
+
+                  root.addView(
+                      panel,
+                      FrameLayout.LayoutParams(
+                          ViewGroup.LayoutParams.MATCH_PARENT,
+                          ViewGroup.LayoutParams.WRAP_CONTENT,
+                          Gravity.BOTTOM
+                      )
+                  )
+                  setContentView(root)
+              }
+
+              private fun pickFile() {
+                  val i = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+                      addCategory(Intent.CATEGORY_OPENABLE)
+                      type = "*/*"
+                      putExtra(Intent.EXTRA_MIME_TYPES, arrayOf("audio/*", "video/*"))
+                  }
+                  startActivityForResult(i, 1)
+              }
+
+              @Deprecated("Deprecated in Java")
+              override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+                  super.onActivityResult(requestCode, resultCode, data)
+                  if (requestCode == 1 && resultCode == RESULT_OK && data?.data != null) {
+                      stopPlay()
+                      uri = data.data
+                      playBtn.isEnabled = false
+                      status.text = "Analysing beats..."
+                      analyze(uri!!)
+                  }
+              }
+
+              private fun analyze(u: Uri) {
+                  thread {
+                      try {
+                          decodeEnergy(u)
+                          runOnUiThread {
+                              detect()
+                              playBtn.isEnabled = true
+                          }
+                      } catch (e: Exception) {
+                          runOnUiThread { status.text = "Error: ${e.message}" }
+                      }
+                  }
+              }
+
+              // Decode audio to PCM and store low-frequency (kick/bass) energy every ~10ms
+              private fun decodeEnergy(u: Uri) {
+                  val ex = MediaExtractor()
+                  ex.setDataSource(this, u, null)
+                  var track = -1
+                  var fmt: MediaFormat? = null
+                  for (i in 0 until ex.trackCount) {
+                      val f = ex.getTrackFormat(i)
+                      if (f.getString(MediaFormat.KEY_MIME)!!.startsWith("audio/")) { track = i; fmt = f; break }
+                  }
+                  if (track < 0 || fmt == null) throw Exception("No audio track found")
+                  ex.selectTrack(track)
+
+                  val codec = MediaCodec.createDecoderByType(fmt.getString(MediaFormat.KEY_MIME)!!)
+                  codec.configure(fmt, null, null, 0)
+                  codec.start()
+
+                  val sampleRate = fmt.getInteger(MediaFormat.KEY_SAMPLE_RATE)
+                  var channels = fmt.getInteger(MediaFormat.KEY_CHANNEL_COUNT)
+                  val hop = sampleRate / 100
+                  hopSec = hop.toFloat() / sampleRate
+
+                  val out = ArrayList<Float>()
+                  val info = MediaCodec.BufferInfo()
+                  var inputDone = false
+                  var outputDone = false
+                  var acc = 0.0
+                  var cnt = 0
+                  var lp = 0f
+
+                  while (!outputDone) {
+                      if (!inputDone) {
+                          val ii = codec.dequeueInputBuffer(10000)
+                          if (ii >= 0) {
+                              val buf = codec.getInputBuffer(ii)!!
+                              val n = ex.readSampleData(buf, 0)
+                              if (n < 0) {
+                                  codec.queueInputBuffer(ii, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
+                                  inputDone = true
+                              } else {
+                                  codec.queueInputBuffer(ii, 0, n, ex.sampleTime, 0)
+                                  ex.advance()
+                              }
+                          }
+                      }
+                      val oi = codec.dequeueOutputBuffer(info, 10000)
+                      if (oi >= 0) {
+                          val buf = codec.getOutputBuffer(oi)!!
+                          buf.order(ByteOrder.LITTLE_ENDIAN)
+                          buf.position(info.offset)
+                          buf.limit(info.offset + info.size)
+                          val sb = buf.asShortBuffer()
+                          while (sb.remaining() >= channels) {
+                              var x = 0f
+                              for (c in 0 until channels) x += sb.get() / 32768f
+                              x /= channels
+                              lp += 0.1f * (x - lp)          // simple low-pass: keeps the bass / kick
+                              acc += (lp * lp).toDouble()
+                              cnt++
+                              if (cnt == hop) {
+                                  out.add(sqrt(acc / cnt).toFloat())
+                                  acc = 0.0
+                                  cnt = 0
+                              }
+                          }
+                          codec.releaseOutputBuffer(oi, false)
+                          if (info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0) outputDone = true
+                      } else if (oi == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
+                          channels = codec.outputFormat.getInteger(MediaFormat.KEY_CHANNEL_COUNT)
+                      }
+                  }
+                  codec.stop()
+                  codec.release()
+                  ex.release()
+                  env = out.toFloatArray()
+              }
+
+              // Find beats: peaks in the energy increase that stand out from the local average
+              private fun detect() {
+                  val n = env.size
+                  if (n < 10) { status.text = "Audio too short"; return }
+
+                  // smooth then take positive difference (onset strength)
+                  val sm = FloatArray(n)
+                  for (i in 0 until n) {
+                      var s = 0f; var c = 0
+                      for (k in -1..1) { val j = i + k; if (j in 0 until n) { s += env[j]; c++ } }
+                      sm[i] = s / c
+                  }
+                  val flux = FloatArray(n)
+                  for (i in 1 until n) flux[i] = max(0f, sm[i] - sm[i - 1])
+                  val peakMax = flux.max()
+
+                  val p = seek.progress
+                  val mult = 3f - 2f * p / 100f           // 3 (few cuts) .. 1 (many cuts)
+                  val minGap = 0.65f - 0.4f * p / 100f    // seconds between cuts
+
+                  val prefix = FloatArray(n + 1)
+                  for (i in 0 until n) prefix[i + 1] = prefix[i] + flux[i]
+                  val w = 50
+                  val found = ArrayList<Float>()
+                  var last = -10f
+                  for (i in 1 until n - 1) {
+                      val a = max(0, i - w)
+                      val b = minOf(n, i + w + 1)
+                      val mean = (prefix[b] - prefix[a]) / (b - a)
+                      val t = i * hopSec
+                      if (flux[i] > mean * mult && flux[i] > peakMax * 0.08f &&
+                          flux[i] >= flux[i - 1] && flux[i] > flux[i + 1] && t - last >= minGap
+                      ) {
+                          found.add(t)
+                          last = t
+                      }
+                  }
+                  beats = found
+                  status.text = "${beats.size} cut points found"
+              }
+
+              private fun startPlay() {
+                  val u = uri ?: return
+                  val mp = MediaPlayer()
+                  mp.setDataSource(this, u)
+                  mp.prepare()
+                  mp.setOnCompletionListener { stopPlay() }
+                  player = mp
+                  nextBeat = 0
+                  mp.start()
+                  playBtn.text = "Stop"
+                  handler.post(ticker)
+              }
+
+              private fun stopPlay() {
+                  handler.removeCallbacks(ticker)
+                  player?.release()
+                  player = null
+                  if (::playBtn.isInitialized) playBtn.text = "Play"
+              }
+
+              private val ticker = object : Runnable {
+                  override fun run() {
+                      val mp = player ?: return
+                      val pos = mp.currentPosition / 1000f + latencyFix
+                      var changed = false
+                      while (nextBeat < beats.size && beats[nextBeat] <= pos) {
+                          nextBeat++
+                          changed = true
+                      }
+                      if (changed) changeColour()
+                      handler.postDelayed(this, 8)
+                  }
+              }
+
+              // Hard cut to a clearly different colour, TikTok-edit style
+              private fun changeColour() {
+                  hue = (hue + 70f + Random.nextFloat() * 220f) % 360f
+                  root.setBackgroundColor(Color.HSVToColor(floatArrayOf(hue, 0.9f, 1f)))
+              }
+
+              override fun onPause() {
+                  super.onPause()
+                  stopPlay()
+              }
+          }
+          EOF_FILE
+      - name: Build
+        run: gradle assembleDebug
+      - uses: actions/upload-artifact@v4
+        with:
+          name: BeatColour-apk
+          path: app/build/outputs/apk/debug/*.apk
